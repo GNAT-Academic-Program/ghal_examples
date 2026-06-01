@@ -1,0 +1,24 @@
+name = "ghal_examples"
+description = ""
+version = "0.1.0-dev"
+
+authors = ["Your Name"]
+maintainers = ["Your Name <example@example.com>"]
+licenses = "MIT OR Apache-2.0 WITH LLVM-exception"
+website = ""
+tags = []
+
+executables = ["ghal_examples"]
+
+[[depends-on]]
+stm32f746g_disco = "*"
+#nucleo_g431kb = "*"
+#nor_flash_generic = "*"
+#w25q128 = "*"
+
+[[pins]]
+stm32f746g_disco = { url = "https://github.com/GNAT-Academic-Program/stm32f746g_disco.git", branch = "main" }
+#nucleo_g431kb = { url = "https://github.com/GNAT-Academic-Program/nucleo_g431kb.git", branch = "main" }
+#nor_flash_generic = { url = "https://github.com/GNAT-Academic-Program/nor_flash_generic.git", branch = "main" }
+#w25q128 = { url = "https://github.com/GNAT-Academic-Program/w25q128.git", branch = "main" }
+
