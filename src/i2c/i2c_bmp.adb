@@ -17,12 +17,8 @@ procedure I2C_Bmp is
 begin
    Board.Initialize;
 
-   Board.I2C_1.Open
-     (Board.I2C_1_Dev,
-      (Speed => I2C_Types.Standard_Mode, Role => I2C_Types.Master_Only));
-
    Debug.Put_Line ("Opening BMP390...");
-   BMP.Open (Sensor, Board.I2C_1_Dev'Access, BMP390_Address, Pwr_Ctrl);
+   BMP.Open (Sensor, BMP390_Address, Pwr_Ctrl);
    Debug.Put_Line ("BMP390 open OK");
 
    loop

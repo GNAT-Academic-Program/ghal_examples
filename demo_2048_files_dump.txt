@@ -1,0 +1,2116 @@
+=== ghal_examples/src/demo_2048/solver.adb ===
+with Interfaces; use Interfaces;
+with MT;         use MT;
+
+package body Solver is
+
+   type Grid_Hash is new UInt64;
+
+   Max_Depth : constant := 3;
+
+   function Hash (G : CGrid) return Grid_Hash is
+      H : Grid_Hash := 0;
+   begin
+      for Y in Size loop
+         for X in Size loop
+            H := Shift_Left (H, 4) or Grid_Hash (G.Get (X, Y) mod 16);
+         end loop;
+      end loop;
+      return H;
+   end Hash;
+
+   function Eval (G : CGrid) return Float is
+      Score : Float := Float (G.Score);
+      Empty : Natural := 0;
+   begin
+      for Y in Size loop
+         for X in Size loop
+            if G.Get (X, Y) = 0 then
+               Empty := Empty + 1;
+            end if;
+         end loop;
+      end loop;
+      return Score + Float (Empty) * 10.0;
+   end Eval;
+
+   function Expectimax
+     (G     : CGrid;
+      Depth : Natural;
+      Is_Max : Boolean) return Float;
+
+   function Expectimax
+     (G     : CGrid;
+      Depth : Natural;
+      Is_Max : Boolean) return Float
+   is
+      Dirs : constant array (1 .. 4) of Direction_E :=
+        (Up, Down, Left, Right);
+   begin
+      if Depth = 0 then
+         return Eval (G);
+      end if;
+
+      if Is_Max then
+         declare
+            Best : Float := -1.0e10;
+         begin
+            for D of Dirs loop
+               declare
+                  Test_Grid : CGrid := G;
+               begin
+                  if Test_Grid.Can_Move (D) then
+                     declare
+                        Next  : CGrid := G;
+                        Trace : Trace_Grid_T;
+                        Val   : Float;
+                     begin
+                        Trace := Next.Move (D);
+                        Val := Expectimax (Next, Depth - 1, False);
+                        if Val > Best then
+                           Best := Val;
+                        end if;
+                     end;
+                  end if;
+               end;
+            end loop;
+            return Best;
+         end;
+      else
+         --  Chance node: average over possible tile spawns
+         declare
+            Sum   : Float := 0.0;
+            Count : Natural := 0;
+         begin
+            for Y in Size loop
+               for X in Size loop
+                  if G.Get (X, Y) = 0 then
+                     for Val in 1 .. 2 loop
+                        declare
+                           Next : CGrid := G;
+                        begin
+                           Next.Set (X, Y, Val);
+                           Sum := Sum + Expectimax (Next, Depth - 1, True);
+                           Count := Count + 1;
+                        end;
+                     end loop;
+                  end if;
+               end loop;
+            end loop;
+            if Count = 0 then
+               return Eval (G);
+            else
+               return Sum / Float (Count);
+            end if;
+         end;
+      end if;
+   end Expectimax;
+
+   function Next_Move (G : CGrid) return Move_Type is
+      Dirs : constant array (1 .. 4) of Direction_E :=
+        (Up, Down, Left, Right);
+      Best_Dir : Move_Type := None;
+      Best_Val : Float := -1.0e10;
+   begin
+      for D of Dirs loop
+         declare
+            Test_Grid : CGrid := G;
+         begin
+            if Test_Grid.Can_Move (D) then
+               declare
+                  Next  : CGrid := G;
+                  Trace : Trace_Grid_T;
+                  Val   : Float;
+               begin
+                  Trace := Next.Move (D);
+                  Val := Expectimax (Next, Max_Depth, False);
+                  if Val > Best_Val then
+                     Best_Val := Val;
+                     case D is
+                        when Up    => Best_Dir := Up;
+                        when Down  => Best_Dir := Down;
+                        when Left  => Best_Dir := Left;
+                        when Right => Best_Dir := Right;
+                     end case;
+                  end if;
+               end;
+            end if;
+         end;
+      end loop;
+      return Best_Dir;
+   end Next_Move;
+
+end Solver;
+=== ghal_examples/src/demo_2048/game.adb ===
+with Board;
+with MT;            use MT;
+with RNG_Types;     use RNG_Types;
+with Ada.Real_Time; use Ada.Real_Time;
+with Bitmapped_Drawing;
+
+package body Game is
+
+   use type Random_Value;
+
+   procedure Init_Font is
+   begin
+      Hershey_Fonts.Read (Hershey_Fonts.FuturaL.Font, Times);
+   end Init_Font;
+
+   --  Forward declarations
+   procedure Init_Background;
+   procedure Init_Cells;
+   procedure Add_Tile;
+   procedure Init_Slide (Old_Grid : CGrid; Trace : Trace_Grid_T);
+
+   --  -----------------------------------------------------------------------
+   --  Layout helpers
+   --  -----------------------------------------------------------------------
+
+   function Screen_Size return Natural is
+     (Natural'Min (Board.LCD_Width, Board.LCD_Height));
+
+   function Cell_To_Pt (X, Y : Size) return Pt is
+     (Pt'(X => Ext_Border + Integer (X) * (Cell_Size + Int_Border),
+          Y => Ext_Border + Integer (Y) * (Cell_Size + Int_Border)));
+
+   --  -----------------------------------------------------------------------
+   --  Get_Status_Area
+   --  -----------------------------------------------------------------------
+
+   function Get_Status_Area return Rect is
+      SS : constant Natural := Screen_Size;
+   begin
+      if Board.LCD_Height >= Board.LCD_Width then
+         --  Portrait: status strip at top
+         return (X => 0, Y => 0,
+                 Width  => Board.LCD_Width,
+                 Height => Board.LCD_Height - SS);
+      else
+         --  Landscape (480x272): status strip on right
+         return (X => SS, Y => 0,
+                 Width  => Board.LCD_Width - SS,
+                 Height => Board.LCD_Height);
+      end if;
+   end Get_Status_Area;
+
+   function Get_Score return Natural is (The_Grid.Score);
+
+   --  -----------------------------------------------------------------------
+   --  Init
+   --  -----------------------------------------------------------------------
+
+   procedure Init is
+      SS         : constant Natural := Screen_Size;
+      CM         : constant Bitmap_Color_Mode :=
+                     Board.FB_1.Get_Color_Mode (Layer_1);
+      Pixel_Size : constant Natural :=
+                     Board.FB_1.Get_Pixel_Size (Layer_1);
+   begin
+      Cell_Size  := (SS - 5 * 8) / 4;
+      Int_Border := 8;
+      Ext_Border := (SS - 4 * Cell_Size - 3 * Int_Border) / 2;
+      Up_Margin  := Board.LCD_Height - SS;
+
+      Background_Buffer :=
+        (Addr       => Board.SDRAM_1.Reserve
+                         (UInt32 (SS * SS * Pixel_Size)),
+         Color_Mode => CM,
+         Width      => SS,
+         Height     => SS,
+         Swapped    => Board.FB_1.Is_Swapped);
+
+      Background_Slide_Buffer :=
+        (Addr       => Board.SDRAM_1.Reserve
+                         (UInt32 (SS * SS * Pixel_Size)),
+         Color_Mode => CM,
+         Width      => SS,
+         Height     => SS,
+         Swapped    => Board.FB_1.Is_Swapped);
+
+      Cells_Buffer :=
+        (Addr       => Board.SDRAM_1.Reserve
+                         (UInt32 (Cell_Size * Cell_Size * 16 * Pixel_Size)),
+         Color_Mode => CM,
+         Width      => Cell_Size,
+         Height     => Cell_Size * 16,
+         Swapped    => Board.FB_1.Is_Swapped);
+
+      Init_Background;
+      Init_Cells;
+   end Init;
+
+   --  -----------------------------------------------------------------------
+   --  Init_Background
+   --  -----------------------------------------------------------------------
+
+   procedure Init_Background is
+      BG : constant Bitmap_Color := (255, 187, 173, 160);
+      Cell_BG : constant Bitmap_Color := (255, 16#CD#, 16#C0#, 16#B4#);
+   begin
+      Board.DMA2D.Fill (Background_Buffer, BG, True);
+      for Y in 0 .. 3 loop
+         for X in 0 .. 3 loop
+            Board.DMA2D.Fill_Rect
+              (Background_Buffer, Cell_BG,
+               Ext_Border + (Int_Border + Cell_Size) * X,
+               Ext_Border + (Int_Border + Cell_Size) * Y,
+               Cell_Size, Cell_Size, True);
+         end loop;
+      end loop;
+   end Init_Background;
+
+   --  -----------------------------------------------------------------------
+   --  Init_Cells — 16 tile sprites in a vertical strip
+   --  -----------------------------------------------------------------------
+
+   procedure Init_Cells is
+      Colors : constant array (0 .. 15) of Bitmap_Color :=
+        ((255, 238, 228, 218), (255, 237, 224, 200),
+         (255, 242, 177, 121), (255, 245, 149, 99),
+         (255, 246, 124, 95),  (255, 246, 94,  59),
+         (255, 237, 207, 114), (255, 237, 204, 97),
+         (255, 237, 200, 80),  (255, 237, 197, 63),
+         (255, 237, 194, 46),  (255, 60,  58,  50),
+         (255, 60,  209, 50),  (255, 35,  107, 29),
+         (255, 50,  136, 209), (255, 17,  15,  104));
+   begin
+      Board.DMA2D.Fill (Cells_Buffer, Transparent, True);
+      for I in Colors'Range loop
+         Board.DMA2D.Fill_Rect
+           (Cells_Buffer, Colors (I),
+            0, I * Cell_Size, Cell_Size, Cell_Size, True);
+
+         --  Draw tile number
+         declare
+            Num    : constant Positive := 2 ** (I + 1);
+            S      : constant String   := Num'Image;
+            FG     : constant Bitmap_Color :=
+                       (if Num <= 4
+                        then (255, 100, 90, 80)
+                        else White);
+            H      : constant Natural  := Cell_Size * 2 / 5;
+            Margin : constant Natural  := Cell_Size / 8;
+         begin
+            Bitmapped_Drawing.Draw_String
+              (Buffer  => Cells_Buffer,
+               Start_X => Margin,
+               Start_Y => I * Cell_Size + (Cell_Size - H) / 2,
+               Msg     => S (S'First + 1 .. S'Last),
+               Font    => Times,
+               Height  => H,
+               Bold    => True,
+               Foreground => FG);
+            Board.DMA2D.Wait_Transfer;
+         end;
+      end loop;
+   end Init_Cells;
+
+   --  -----------------------------------------------------------------------
+   --  Start
+   --  -----------------------------------------------------------------------
+
+   procedure Start is
+   begin
+      The_Grid.Init;
+      Add_Tile;
+      Add_Tile;
+   end Start;
+
+   --  -----------------------------------------------------------------------
+   --  Add_Tile
+   --  -----------------------------------------------------------------------
+
+   procedure Add_Tile is
+      Rand  : Random_Value := Board.RNG_1.Random;
+      N_Free : Natural := 0;
+      Val    : constant Natural :=
+                 (if Board.RNG_1.Random mod 10 = 0 then 2 else 1);
+      Pos    : Natural;
+   begin
+      for X in Size loop
+         for Y in Size loop
+            if The_Grid.Get (X, Y) = 0 then
+               N_Free := N_Free + 1;
+            end if;
+         end loop;
+      end loop;
+      if N_Free = 0 then return; end if;
+      Pos := Natural (Rand mod Random_Value (N_Free));
+      N_Free := 0;
+      Outer :
+      for X in Size loop
+         for Y in Size loop
+            if The_Grid.Get (X, Y) = 0 then
+               if N_Free = Pos then
+                  The_Grid.Set (X, Y, Val);
+                  exit Outer;
+               end if;
+               N_Free := N_Free + 1;
+            end if;
+         end loop;
+      end loop Outer;
+   end Add_Tile;
+
+   --  -----------------------------------------------------------------------
+   --  Draw
+   --  -----------------------------------------------------------------------
+
+   procedure Copy_BG_To (Dst : Bitmap_Buffer) is
+   begin
+      Board.DMA2D.Copy_Rect
+        (Src_Buffer => Background_Buffer,
+         X_Src => 0, Y_Src => 0,
+         Dst_Buffer => Dst,
+         X_Dst => 0, Y_Dst => Dst.Height - Background_Buffer.Height,
+         Width  => Background_Buffer.Width,
+         Height => Background_Buffer.Height,
+         Synchronous => False);
+   end Copy_BG_To;
+
+   procedure Draw_Tile (Coord : Pt; Value : Integer; Dst : Bitmap_Buffer) is
+   begin
+      Board.DMA2D.Copy_Rect_Blend
+        (Src_Buffer => Cells_Buffer,
+         X_Src => 0, Y_Src => (Value - 1) * Cell_Size,
+         Dst_Buffer => Dst,
+         X_Dst => Coord.X, Y_Dst => Coord.Y,
+         Width  => Cell_Size,
+         Height => Cell_Size,
+         Synchronous => False);
+   end Draw_Tile;
+
+   procedure Draw (Dst : Bitmap_Buffer) is
+   begin
+      Board.DMA2D.Wait_Transfer;
+      Copy_BG_To (Dst);
+      for Y in Size loop
+         for X in Size loop
+            declare
+               V : constant Integer := The_Grid.Get (X, Y);
+               P : Pt;
+            begin
+               if V /= 0 then
+                  P   := Cell_To_Pt (X, Y);
+                  P.Y := P.Y + Dst.Height - Background_Buffer.Height;
+                  Draw_Tile (P, V, Dst);
+               end if;
+            end;
+         end loop;
+      end loop;
+   end Draw;
+
+   --  -----------------------------------------------------------------------
+   --  Move + slide animation
+   --  -----------------------------------------------------------------------
+
+   procedure Move (Direction : Direction_E) is
+      Old_Grid : constant CGrid := The_Grid;
+      Trace    : Trace_Grid_T;
+   begin
+      Trace := The_Grid.Move (Direction);
+      Init_Slide (Old_Grid, Trace);
+      Add_Tile;
+   end Move;
+
+   function Can_Move (Direction : Direction_E) return Boolean is
+     (The_Grid.Can_Move (Direction));
+
+   function Is_Sliding return Boolean is (Sliding);
+
+   procedure Init_Slide (Old_Grid : CGrid; Trace : Trace_Grid_T) is
+   begin
+      Slide_Start_Time := Clock;
+      Copy_BG_To (Background_Slide_Buffer);
+      Board.DMA2D.Wait_Transfer;
+
+      for Y in Size loop
+         for X in Size loop
+            declare
+               I : constant Moving_Cells_Index_T :=
+                     Integer (Y) * Size'Range_Length + Integer (X);
+               P : constant Cell_Position_T := Trace (X, Y);
+            begin
+               if P.X /= X or else P.Y /= Y then
+                  declare
+                     Src_P : Pt := Cell_To_Pt (X, Y);
+                     Dst_P : Pt := Cell_To_Pt (P.X, P.Y);
+                  begin
+                     Src_P.Y := Src_P.Y + Up_Margin;
+                     Dst_P.Y := Dst_P.Y + Up_Margin;
+                     Moving_Cells (I) :=
+                       (Src       => Src_P,
+                        Dst       => Dst_P,
+                        Src_Value => Old_Grid.Get (X, Y),
+                        Dst_Value => The_Grid.Get (P.X, P.Y),
+                        V         => (X => (if P.X > X then 1 elsif P.X < X then -1 else 0),
+                                      Y => (if P.Y > Y then 1 elsif P.Y < Y then -1 else 0)),
+                        Max_Length => abs (Dst_P.X - Src_P.X) +
+                                      abs (Dst_P.Y - Src_P.Y),
+                        Moving    => True);
+                  end;
+               else
+                  Moving_Cells (I) := (others => <>);
+                  Moving_Cells (I).Moving := False;
+                  if Old_Grid.Get (X, Y) /= 0 then
+                     Draw_Tile (Cell_To_Pt (X, Y),
+                                Old_Grid.Get (X, Y),
+                                Background_Slide_Buffer);
+                  end if;
+               end if;
+            end;
+         end loop;
+      end loop;
+      Sliding := True;
+   end Init_Slide;
+
+   function Slide (Dst : Bitmap_Buffer) return Boolean is
+      Slide_Speed : constant Float := Float (Background_Buffer.Width) * 4.0;
+      Length      : constant Integer :=
+                      Integer (Slide_Speed *
+                        Float (Ada.Real_Time.To_Duration
+                          (Clock - Slide_Start_Time)));
+      Still_Moving : Boolean := False;
+      BG_Changed   : Boolean := False;
+   begin
+      for Cell of Moving_Cells loop
+         if Cell.Moving and then Length >= Cell.Max_Length then
+            Cell.Moving := False;
+            BG_Changed  := True;
+            Draw_Tile ((Cell.Dst.X, Cell.Dst.Y - Up_Margin),
+                       Cell.Dst_Value,
+                       Background_Slide_Buffer);
+         end if;
+      end loop;
+
+      if BG_Changed then
+         Board.DMA2D.Wait_Transfer;
+      end if;
+
+      Copy_BG_To (Dst);
+      Board.DMA2D.Wait_Transfer;
+
+      for Cell of Moving_Cells loop
+         if Cell.Moving then
+            Still_Moving := True;
+            Draw_Tile
+              ((Cell.Src.X + Length * Cell.V.X,
+                Cell.Src.Y + Length * Cell.V.Y),
+               Cell.Src_Value, Dst);
+         end if;
+      end loop;
+
+      if not Still_Moving then
+         Sliding := False;
+      end if;
+      return Sliding;
+   end Slide;
+
+   --  -----------------------------------------------------------------------
+   --  Treat_Touch
+   --  -----------------------------------------------------------------------
+
+   Previous : Gesture_Types.Gesture_Id := Gesture_Types.No_Gesture;
+
+   procedure Treat_Touch (G : Gesture_Data) is
+      use Gesture_Types;
+   begin
+      if not Sliding and then Previous = No_Gesture then
+         case G.Id is
+            when V_Scroll =>
+               Move (if G.Cumulated > 0 then Down else Up);
+               Previous := V_Scroll;
+            when H_Scroll =>
+               Move (if G.Cumulated > 0 then Right else Left);
+               Previous := H_Scroll;
+            when others => null;
+         end case;
+      end if;
+      if G.Id = No_Gesture then
+         Previous := No_Gesture;
+      end if;
+   end Treat_Touch;
+
+end Game;
+=== ghal_examples/src/demo_2048/grid.ads ===
+------------------------------------------------------------------------------
+--                        Bareboard drivers examples                        --
+--                                                                          --
+--                     Copyright (C) 2015-2016, AdaCore                     --
+--                                                                          --
+-- This library is free software;  you can redistribute it and/or modify it --
+-- under terms of the  GNU General Public License  as published by the Free --
+-- Software  Foundation;  either version 3,  or (at your  option) any later --
+-- version. This library is distributed in the hope that it will be useful, --
+-- but WITHOUT ANY WARRANTY;  without even the implied warranty of MERCHAN- --
+-- TABILITY or FITNESS FOR A PARTICULAR PURPOSE.                            --
+--                                                                          --
+-- As a special exception under Section 7 of GPL version 3, you are granted --
+-- additional permissions described in the GCC Runtime Library Exception,   --
+-- version 3.1, as published by the Free Software Foundation.               --
+--                                                                          --
+-- You should have received a copy of the GNU General Public License and    --
+-- a copy of the GCC Runtime Library Exception along with this program;     --
+-- see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see    --
+-- <http://www.gnu.org/licenses/>.                                          --
+--                                                                          --
+------------------------------------------------------------------------------
+
+package Grid is
+   type Size is new Integer range 0 .. 3;
+
+   type Grid_T is array (Size, Size) of Integer;
+
+   type Direction_E is (Left, Up, Right, Down);
+
+   type CGrid is tagged record
+      Grid  : Grid_T;
+      Score : Natural;
+   end record;
+
+
+   type Cell_Position_T is record
+      X : Size;
+      Y : Size;
+   end record;
+   type Moving_Tile_T is record
+      Current : Cell_Position_T;
+      Previous : Cell_Position_T;
+   end record;
+   type Trace_Grid_T is array (Size, Size) of Cell_Position_T;
+
+   procedure Init (G : in out CGrid);
+
+   function Get
+     (G : in CGrid;
+      X : Size;
+      Y : Size) return Integer with Inline;
+
+   procedure Set
+     (G     : in out CGrid;
+      X     : Size;
+      Y     : Size;
+      Value : Integer) with Inline;
+
+   procedure Move
+     (G         : in out CGrid;
+      Direction : Direction_E);
+
+   function Move
+     (G         : in out CGrid;
+      Direction : Direction_E) return Trace_Grid_T;
+
+   function Can_Move
+     (G         : in out CGrid;
+      Direction : Direction_E) return Boolean;
+
+private
+   type Row_T is array (Size) of Integer;
+   type Row_Trace_T is array (Size) of Size;
+
+   type Rows_T is array (Size) of Row_T;
+
+   type Rows_Traces_T is array (Size) of Row_Trace_T;
+
+   procedure Compact_Row (Row   : in out Row_T;
+                          Score : in out Natural);
+
+   function Compact_Row (Row   : in out Row_T;
+                         Score : in out Natural) return Row_Trace_T;
+
+   procedure Compact_Rows (Rows  : in out Rows_T;
+                           Score : in out Natural);
+
+   function Compact_Rows (Rows  : in out Rows_T;
+                          Score : in out Natural) return Rows_Traces_T;
+
+   function Grid_To_Rows
+     (G         : in CGrid;
+      Direction : Direction_E)  return Rows_T;
+
+   procedure Rows_To_Grid
+     (G         : in out CGrid;
+      Rows      : Rows_T;
+      Direction : Direction_E);
+
+   function Traces_To_Move_Grid
+     (Traces    : Rows_Traces_T;
+      Direction : Direction_E) return Trace_Grid_T;
+
+end Grid;
+=== ghal_examples/src/demo_2048/hershey_fonts.adb ===
+------------------------------------------------------------------------------
+--                        Bareboard drivers examples                        --
+--                                                                          --
+--                     Copyright (C) 2015-2016, AdaCore                     --
+--                                                                          --
+-- This library is free software;  you can redistribute it and/or modify it --
+-- under terms of the  GNU General Public License  as published by the Free --
+-- Software  Foundation;  either version 3,  or (at your  option) any later --
+-- version. This library is distributed in the hope that it will be useful, --
+-- but WITHOUT ANY WARRANTY;  without even the implied warranty of MERCHAN- --
+-- TABILITY or FITNESS FOR A PARTICULAR PURPOSE.                            --
+--                                                                          --
+-- As a special exception under Section 7 of GPL version 3, you are granted --
+-- additional permissions described in the GCC Runtime Library Exception,   --
+-- version 3.1, as published by the Free Software Foundation.               --
+--                                                                          --
+-- You should have received a copy of the GNU General Public License and    --
+-- a copy of the GCC Runtime Library Exception along with this program;     --
+-- see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see    --
+-- <http://www.gnu.org/licenses/>.                                          --
+--                                                                          --
+------------------------------------------------------------------------------
+
+package body Hershey_Fonts is
+
+   function Get_Glyph (C : Character) return Glyph_Index;
+
+   ---------------
+   -- Get_Glyph --
+   ---------------
+
+   function Get_Glyph (C : Character) return Glyph_Index
+   is
+      Ret : constant Integer := Character'Pos (C) - 31;
+   begin
+      if not Valid_Glyph (Ret) then
+         return Get_Glyph ('?');
+      else
+         return Glyph_Index (Ret);
+      end if;
+   end Get_Glyph;
+
+   ----------------
+   -- Draw_Glyph --
+   ----------------
+
+   procedure Draw_Glyph
+     (Fnt    : Hershey_Font;
+      C      : Character;
+      X      : in out Natural;
+      Y      : Natural;
+      Height : Natural;
+      Bold   : Boolean)
+   is
+      Ratio     : constant Float := Float (Height) / Float (Fnt.Font_Height);
+      Thickness : Natural := Natural ((if Bold then 3.0 else 2.0) * Ratio);
+      G         : constant Glyph := Fnt.Glyphs (Get_Glyph (C));
+      First     : Boolean := True;
+      Current   : Coord;
+
+   begin
+      if Thickness < 1 then
+         Thickness := 1;
+      end if;
+
+      for V in 1 .. G.Vertices loop
+         if G.Coords (V) = Raise_Pen then
+            First := True;
+         elsif First then
+            Current := G.Coords (V);
+            First   := False;
+         else
+            declare
+               X0, Y0, X1, Y1 : Natural;
+            begin
+               X0 := Natural (Float (Current.X) * Ratio) + X;
+               Y0 := Natural (Float (Current.Y) * Ratio) + Y;
+               Current := G.Coords (V);
+               X1 := Natural (Float (Current.X) * Ratio) + X;
+               Y1 := Natural (Float (Current.Y) * Ratio) + Y;
+               Draw_Line (X0, Y0, X1, Y1, Thickness);
+            end;
+         end if;
+      end loop;
+
+      X := X + Natural (Float (G.Width) * Ratio);
+   end Draw_Glyph;
+
+   ------------
+   -- Strlen --
+   ------------
+
+   function Strlen (S      : String;
+                    Fnt    : Hershey_Font;
+                    Height : Natural) return Natural
+   is
+      Ret   : Natural := 0;
+      Ratio : constant Float := Float (Height) / Float (Fnt.Font_Height);
+   begin
+      for C of S loop
+         declare
+            G : Glyph renames Fnt.Glyphs (Get_Glyph (C));
+         begin
+            Ret := Ret + Natural (Float (G.Width) * Ratio);
+         end;
+      end loop;
+
+      return Ret;
+   end Strlen;
+
+   ----------
+   -- Read --
+   ----------
+
+   function Read (Fnt : Font_Desc) return Hershey_Font
+   is
+      Ret : Hershey_Font;
+   begin
+      Read (Fnt, Ret);
+      return Ret;
+   end Read;
+
+   ----------
+   -- Read --
+   ----------
+
+   procedure Read (Fnt : Font_Desc;
+                   Ret : out Hershey_Font)
+   is
+      Glyph_Idx   : Natural := 0;
+      Fnt_Idx     : Natural;
+      Fnt_Y_Min   : Integer_8 := Integer_8'Last;
+
+      function To_Byte (S : String) return Natural;
+
+      -------------
+      -- To_Byte --
+      -------------
+
+      function To_Byte (S : String) return Natural
+      is
+         Ret : Natural := 0;
+      begin
+         for J in S'Range loop
+            if S (J) /= ' ' then
+               Ret := 10 * Ret + Character'Pos (S (J)) - Character'Pos ('0');
+            end if;
+         end loop;
+         return Ret;
+      end To_Byte;
+
+   begin
+      Fnt_Idx := Fnt'First;
+
+      while Fnt_Idx <= Fnt'Last loop
+         --  Skip the 5 first characters of the glyph header
+         Fnt_Idx := Fnt_Idx + 5;
+
+         declare
+            Size  : constant Natural := To_Byte (Fnt (Fnt_Idx .. Fnt_Idx + 2));
+            G     : Glyph;
+            CStr  : String (1 .. 2);
+            C     : Coord;
+            Left  : Integer_8;
+            XMin  : Integer_8 := Integer_8'Last;
+            YMin  : Integer_8 := Integer_8'Last;
+            XMax  : Integer_8 := Integer_8'First;
+            YMax  : Integer_8 := Integer_8'First;
+
+         begin
+            Fnt_Idx := Fnt_Idx + 3;
+
+            for Idx in 0 .. Size - 1 loop
+               for J in CStr'Range loop
+                  while Fnt (Fnt_Idx) = ASCII.LF loop
+                     Fnt_Idx := Fnt_Idx + 1;
+                  end loop;
+
+                  CStr (J) := Fnt (Fnt_Idx);
+                  Fnt_Idx := Fnt_Idx + 1;
+               end loop;
+
+               if CStr = " R" then
+                  G.Coords (Idx) := Raise_Pen;
+               else
+                  C := (Character'Pos (CStr (1)) - Character'Pos ('R'),
+                        Character'Pos (CStr (2)) - Character'Pos ('R'));
+
+                  if Idx = 0 then
+                     --  First coordinate tells the left and right borders of
+                     --  the glyph.
+                     Left := C.X;
+                     G.Width := Unsigned_8 (C.Y - C.X + 1);
+                  else
+                     C.X := C.X - Left;
+                     XMin := Integer_8'Min (XMin, C.X);
+                     YMin := Integer_8'Min (YMin, C.Y);
+                     XMax := Integer_8'Max (XMax, C.X);
+                     YMax := Integer_8'Max (XMax, C.Y);
+
+                     G.Coords (Idx) := C;
+                  end if;
+               end if;
+            end loop;
+
+            G.Vertices := Size - 1;
+
+            if G.Vertices = 0 then
+               G.Height := 0;
+            else
+               G.Height := Unsigned_8 (YMax - YMin);
+               Fnt_Y_Min := Integer_8'Min (YMin, Fnt_Y_Min);
+            end if;
+
+            Glyph_Idx := Glyph_Idx + 1;
+            Ret.Glyphs (Glyph_Index (Glyph_Idx)) := G;
+         end;
+      end loop;
+
+      Ret.Number_Of_Glyphs := Glyph_Index (Glyph_Idx);
+      Ret.Font_Height := 0;
+
+      for Idx in 1 .. Ret.Number_Of_Glyphs loop
+         declare
+            G : Glyph renames Ret.Glyphs (Idx);
+         begin
+            for Vert in 1 .. G.Vertices loop
+               if G.Coords (Vert) /= Raise_Pen then
+                  G.Coords (Vert).Y := G.Coords (Vert).Y - Fnt_Y_Min;
+               end if;
+            end loop;
+
+            Ret.Baseline := Unsigned_8 (-Fnt_Y_Min);
+            Ret.Font_Height := Unsigned_8'Max (Ret.Font_Height, G.Height);
+         end;
+      end loop;
+   end Read;
+
+end Hershey_Fonts;
+=== ghal_examples/src/demo_2048/bitmapped_drawing.ads ===
+with Bitmap;        use Bitmap;
+with Hershey_Fonts; use Hershey_Fonts;
+
+package Bitmapped_Drawing is
+
+   procedure Draw_String
+     (Buffer     : Bitmap_Buffer;
+      Start_X    : Natural;
+      Start_Y    : Natural;
+      Msg        : String;
+      Font       : Hershey_Font;
+      Height     : Natural;
+      Bold       : Boolean;
+      Foreground : Bitmap_Color;
+      Fast       : Boolean := True);
+   --  Draw Msg into Buffer using Hershey vector font.
+   --  Foreground color used for all strokes.
+
+end Bitmapped_Drawing;
+=== ghal_examples/src/demo_2048/solver.ads ===
+with Grid; use Grid;
+
+package Solver is
+   type Move_Type is (Up, Down, Left, Right, None);
+   function Next_Move (G : CGrid) return Move_Type;
+end Solver;
+=== ghal_examples/src/demo_2048/demo_2048.adb ===
+with Board;
+with DC_Types;      use DC_Types;
+with Bitmap;        use Bitmap;
+with Ada.Real_Time; use Ada.Real_Time;
+with Touch_Types;   use Touch_Types;
+with Gesture;
+with Gesture_Types; use Gesture_Types;
+with Game;
+with Status;
+with Tasking;
+with Debug;
+with I2C_Types;
+
+procedure Demo_2048 is
+   G      : Gesture_Data;
+   Sample : Touch_State;
+   Count  : Touch_Identifier;
+begin
+   Board.Initialize;
+   Debug.Put_Line ("Board.Initialize done");
+
+   Game.Init_Font;
+   Debug.Put_Line ("Game.Init_Font done");
+
+   Board.FB_1.Initialize_Layer
+     (Layer  => Layer_1,
+      Format => RGB565);
+   Debug.Put_Line ("Layer_1 initialized");
+
+   declare
+      SA : constant Rect := Game.Get_Status_Area;
+   begin
+      Debug.Put_Line ("Status area: X=" & SA.X'Image &
+                      " Y=" & SA.Y'Image &
+                      " W=" & SA.Width'Image &
+                      " H=" & SA.Height'Image);
+      if SA.Width > 0 and then SA.Height > 0 then
+         Board.FB_1.Initialize_Layer
+           (Layer  => Layer_2,
+            Format => ARGB4444,
+            X      => SA.X,
+            Y      => SA.Y,
+            Width  => SA.Width,
+            Height => SA.Height);
+         Debug.Put_Line ("Layer_2 initialized");
+      end if;
+   end;
+
+   Board.FB_1.Set_Background (0, 0, 0);
+   Debug.Put_Line ("Background set");
+
+   Game.Init;
+   Debug.Put_Line ("Game.Init done");
+
+   Game.Start;
+   Debug.Put_Line ("Game.Start done");
+
+   declare
+      Buf : constant Bitmap_Buffer := Board.FB_1.Get_Hidden_Buffer (Layer_1);
+   begin
+      Debug.Put_Line ("L1 hidden buf addr:" &
+        Bitmap_Buffer'(Buf)'Address'Image);
+      Game.Draw (Buf);
+      Board.DMA2D.Wait_Transfer;
+      Debug.Put_Line ("Game.Draw done");
+   end;
+
+   declare
+      Buf : constant Bitmap_Buffer := Board.FB_1.Get_Hidden_Buffer (Layer_2);
+   begin
+      Status.Init_Area (Buf);
+      Status.Set_Autoplay_Enabled (True);
+      Status.Set_Score (0);
+      Debug.Put_Line ("Status init done");
+   end;
+
+   Board.FB_1.Update_Layers;
+   Debug.Put_Line ("Update_Layers done - screen should show game");
+
+   loop
+      Count  := Board.Touch_1.Active_Touch_Points;
+      Sample := (if Count > 0
+                 then Board.Touch_1.Get_Touch_Point (1)
+                 else (X => 0, Y => 0, Weight => 0));
+      Gesture.Process (Sample, Count, G);
+      
+      --  Filter gestures: if tap is on autoplay button, toggle solver instead
+      --  of passing to game. Otherwise pass swipes to game.
+      if G.Id = Tap then
+         declare
+            Area : constant Rect := Status.Get_Autoplay_Btn_Area;
+         begin
+            if G.Origin.X >= Area.X and then G.Origin.X < Area.X + Area.Width
+              and then G.Origin.Y >= Area.Y and then G.Origin.Y < Area.Y + Area.Height
+            then
+               Tasking.Toggle_Solver;
+            else
+               Tasking.Handle_Gesture (G);
+            end if;
+         end;
+      else
+         Tasking.Handle_Gesture (G);
+      end if;
+      
+      delay until Clock + Milliseconds (20);
+   end loop;
+end Demo_2048;
+=== ghal_examples/src/demo_2048/tasking.adb ===
+with Ada.Real_Time; use Ada.Real_Time;
+with Bitmap;        use Bitmap;
+with DC_Types;      use DC_Types;
+with Gesture_Types; use Gesture_Types;
+with Gpio;
+with Board;
+with Game;
+with Grid;
+with Status;
+with Solver;
+
+package body Tasking is
+
+   protected Draw_Prot is
+      entry Wait;
+      procedure Signal;
+   private
+      Pending : Boolean := False;
+   end Draw_Prot;
+
+   protected body Draw_Prot is
+      entry Wait when Pending is
+      begin Pending := False; end Wait;
+      procedure Signal is begin Pending := True; end Signal;
+   end Draw_Prot;
+
+   protected Drawing is
+      entry Wait_Done;
+      procedure Set_Busy (B : Boolean);
+   private
+      Idle : Boolean := True;
+   end Drawing;
+
+   protected body Drawing is
+      entry Wait_Done when Idle is begin null; end Wait_Done;
+      procedure Set_Busy (B : Boolean) is begin Idle := not B; end Set_Busy;
+   end Drawing;
+
+   protected Events is
+      entry Wait;
+      procedure Set_Gesture (G : Gesture_Data);
+      procedure Set_Solver_Toggle;
+      function  Has_Gesture return Boolean;
+      procedure Get_Gesture (G : out Gesture_Data);
+      function  Solver_Toggled return Boolean;
+      procedure Clear_Solver_Toggle;
+      function  Solver_On return Boolean;
+   private
+      Has_Event    : Boolean      := False;
+      New_Gesture  : Boolean      := False;
+      Pending_G    : Gesture_Data;
+      Sol_Toggled  : Boolean      := False;
+      Sol_On       : Boolean      := False;
+   end Events;
+
+   protected body Events is
+      entry Wait when Has_Event is
+      begin Has_Event := False; end Wait;
+
+      procedure Set_Gesture (G : Gesture_Data) is
+      begin
+         if G.Id /= No_Gesture then
+            Pending_G   := G;
+            New_Gesture := True;
+            Has_Event   := True;
+         end if;
+      end Set_Gesture;
+
+      procedure Set_Solver_Toggle is
+      begin
+         Sol_On      := not Sol_On;
+         Sol_Toggled := True;
+         Has_Event   := True;
+      end Set_Solver_Toggle;
+
+      function Has_Gesture   return Boolean is (New_Gesture);
+      function Solver_Toggled return Boolean is (Sol_Toggled);
+      function Solver_On      return Boolean is (Sol_On);
+
+      procedure Get_Gesture (G : out Gesture_Data) is
+      begin
+         G           := Pending_G;
+         New_Gesture := False;
+      end Get_Gesture;
+
+      procedure Clear_Solver_Toggle is
+      begin Sol_Toggled := False; end Clear_Solver_Toggle;
+   end Events;
+
+   procedure Handle_Gesture (G : Gesture_Data) is
+   begin
+      Events.Set_Gesture (G);
+   end Handle_Gesture;
+
+   procedure Toggle_Solver is
+   begin
+      Events.Set_Solver_Toggle;
+   end Toggle_Solver;
+
+   task body Slider is
+      Buf : Bitmap_Buffer;
+   begin
+      loop
+         Draw_Prot.Wait;
+         Drawing.Set_Busy (True);
+
+         while Game.Is_Sliding loop
+            Buf := Board.FB_1.Get_Hidden_Buffer (Layer_1);
+            exit when not Game.Slide (Buf);
+            Board.DMA2D.Wait_Transfer;
+            delay until Clock + Milliseconds (16);
+            Board.FB_1.Update_Layer (Layer_1);
+         end loop;
+
+         Buf := Board.FB_1.Get_Hidden_Buffer (Layer_1);
+         Game.Draw (Buf);
+         Board.DMA2D.Wait_Transfer;
+         Status.Set_Score (Game.The_Grid.Score);
+         Board.FB_1.Update_Layers;
+
+         Drawing.Set_Busy (False);
+      end loop;
+   end Slider;
+
+   task body Controller is
+      Sol_On : Boolean := False;
+      G      : Gesture_Data;
+      NM     : Solver.Move_Type;
+   begin
+      loop
+         if not Sol_On then
+            Events.Wait;
+         end if;
+
+         if Events.Solver_Toggled then
+            Sol_On := Events.Solver_On;
+            Events.Clear_Solver_Toggle;
+            Drawing.Wait_Done;
+            Status.Set_Autoplay (Sol_On);
+            Board.FB_1.Update_Layer (Layer_2);
+            if Sol_On then
+               Gpio.Set (Board.Led);
+            else
+               Gpio.Clr (Board.Led);
+            end if;
+         end if;
+
+         if Sol_On then
+            NM := Solver.Next_Move (Game.The_Grid);
+            Drawing.Wait_Done;
+            case NM is
+               when Solver.Up    => Game.Move (Grid.Up);
+               when Solver.Down  => Game.Move (Grid.Down);
+               when Solver.Left  => Game.Move (Grid.Left);
+               when Solver.Right => Game.Move (Grid.Right);
+               when Solver.None  => Game.Start;
+            end case;
+            Draw_Prot.Signal;
+            delay until Clock + Milliseconds (300);
+
+         elsif Events.Has_Gesture then
+            Events.Get_Gesture (G);
+            Game.Treat_Touch (G);
+            Draw_Prot.Signal;
+         end if;
+      end loop;
+   end Controller;
+
+end Tasking;
+=== ghal_examples/src/demo_2048/hershey_fonts-futural.ads ===
+--  This file accompanied the original distribution of the Hershey fonts,
+--  via the Usenet :
+--
+--  This distribution is made possible through the collective encouragement of
+--  the Usenet Font Consortium, a mailing list that sprang to life to get this
+--  accomplished and that will now most likely disappear into the mists of
+--  time... Thanks are especially due to Jim Hurt, who provided the packed
+--  font data for the distribution, along with a lot of other help.
+--
+--  This file describes the Hershey Fonts in general, along with a description
+--  of the other files in this distribution and a simple re-distribution
+--  restriction.
+--
+--  USE RESTRICTION: This distribution of the Hershey Fonts may be used by
+--  anyone for any purpose, commercial or otherwise, providing that:
+--  1. The following acknowledgements must be distributed with the font data:
+--     - The Hershey Fonts were originally created by Dr. A. V. Hershey while
+--       working at the U. S.  National Bureau of Standards.
+--     - The format of the Font data in this distribution was originally
+--       created by:
+--       James Hurt
+--       Cognition, Inc.
+--       900 Technology Park Drive
+--       Billerica, MA 01821
+--       (mit-eddie!ci-dandelion!hurt)
+--  2. The font data in this distribution may be converted into any other
+--     format *EXCEPT* the format distributed by the U.S. NTIS (which
+--     organization holds the rights to the distribution and use of the font
+--     data in that particular format). Not that anybody would really *want*
+--     to use their format... each point is described in eight bytes as
+--     "xxx yyy:", where xxx and yyy are the coordinate values as ASCII
+--     numbers.
+--
+--  *PLEASE* be reassured: The legal implications of NTIS' attempt to control
+--  a particular form of the Hershey Fonts *are* troubling. HOWEVER: We have
+--  been endlessly and repeatedly assured by NTIS that they do not care what
+--  we do with our version of the font data, they do not want to know about
+--  it, they understand that we are distributing this information all over the
+--  world, etc etc etc... but because it isn't in their *exact* distribution
+--  format, they just don't care!!! So go ahead and use the data with a
+--  clear conscience! (If you feel bad about it, take a smaller deduction
+--  for something on your taxes next week...)
+
+package Hershey_Fonts.FuturaL is
+
+   pragma Warnings (Off);
+
+   Desc : aliased constant String :=
+            "12345  1JZ" &
+            "12345  9MWRFRT RRYQZR[SZRY" &
+            "12345  6JZNFNM RVFVM" &
+            "12345 12H]SBLb RYBRb RLOZO RKUYU" &
+            "12345 27H\PBP_ RTBT_ RYIWGTFPFMGKIKKLMMNOOUQWRXSYUYXWZT[P[MZKX" &
+            "12345 32F^[FI[ RNFPHPJOLMMKMIKIIJGLFNFPGSHVHYG[F RWTUUTWTYV[X[Z" &
+            "Z[X[VYTWT" &
+            "12345 35E_\O\N[MZMYNXPVUTXRZP[L[JZIYHWHUISJRQNRMSKSIRGPFNGMIMKN" &
+            "NPQUXWZY[[[\Z\Y" &
+            "12345  8MWRHQGRFSGSIRKQL" &
+            "12345 11KYVBTDRGPKOPOTPYR]T`Vb" &
+            "12345 11KYNBPDRGTKUPUTTYR]P`Nb" &
+            "12345  9JZRLRX RMOWU RWOMU" &
+            "12345  6E_RIR[ RIR[R" &
+            "12345  8NVSWRXQWRVSWSYQ[" &
+            "12345  3E_IR[R" &
+            "12345  6NVRVQWRXSWRV" &
+            "12345  3G][BIb" &
+            "12345 18H\QFNGLJKOKRLWNZQ[S[VZXWYRYOXJVGSFQF" &
+            "12345  5H\NJPISFS[" &
+            "12345 15H\LKLJMHNGPFTFVGWHXJXLWNUQK[Y[" &
+            "12345 16H\MFXFRNUNWOXPYSYUXXVZS[P[MZLYKW" &
+            "12345  7H\UFKTZT RUFU[" &
+            "12345 18H\WFMFLOMNPMSMVNXPYSYUXXVZS[P[MZLYKW" &
+            "12345 24H\XIWGTFRFOGMJLOLTMXOZR[S[VZXXYUYTXQVOSNRNOOMQLT" &
+            "12345  6H\YFO[ RKFYF" &
+            "12345 30H\PFMGLILKMMONSOVPXRYTYWXYWZT[P[MZLYKWKTLRNPQOUNWMXKXIW" &
+            "GTFPF" &
+            "12345 24H\XMWPURRSQSNRLPKMKLLINGQFRFUGWIXMXRWWUZR[P[MZLX" &
+            "12345 12NVROQPRQSPRO RRVQWRXSWRV" &
+            "12345 14NVROQPRQSPRO RSWRXQWRVSWSYQ[" &
+            "12345  4F^ZIJRZ[" &
+            "12345  6E_IO[O RIU[U" &
+            "12345  4F^JIZRJ[" &
+            "12345 21I[LKLJMHNGPFTFVGWHXJXLWNVORQRT RRYQZR[SZRY" &
+            "12345 56E`WNVLTKQKOLNMMPMSNUPVSVUUVS RQKOMNPNSOUPV RWKVSVUXVZV\" &
+            "T]Q]O\L[JYHWGTFQFNGLHJJILHOHRIUJWLYNZQ[T[WZYYZX RXKWSWUXV" &
+            "12345  9I[RFJ[ RRFZ[ RMTWT" &
+            "12345 24G\KFK[ RKFTFWGXHYJYLXNWOTP RKPTPWQXRYTYWXYWZT[K[" &
+            "12345 19H]ZKYIWGUFQFOGMILKKNKSLVMXOZQ[U[WZYXZV" &
+            "12345 16G\KFK[ RKFRFUGWIXKYNYSXVWXUZR[K[" &
+            "12345 12H[LFL[ RLFYF RLPTP RL[Y[" &
+            "12345  9HZLFL[ RLFYF RLPTP" &
+            "12345 23H]ZKYIWGUFQFOGMILKKNKSLVMXOZQ[U[WZYXZVZS RUSZS" &
+            "12345  9G]KFK[ RYFY[ RKPYP" &
+            "12345  3NVRFR[" &
+            "12345 11JZVFVVUYTZR[P[NZMYLVLT" &
+            "12345  9G\KFK[ RYFKT RPOY[" &
+            "12345  6HYLFL[ RL[X[" &
+            "12345 12F^JFJ[ RJFR[ RZFR[ RZFZ[" &
+            "12345  9G]KFK[ RKFY[ RYFY[" &
+            "12345 22G]PFNGLIKKJNJSKVLXNZP[T[VZXXYVZSZNYKXIVGTFPF" &
+            "12345 14G\KFK[ RKFTFWGXHYJYMXOWPTQKQ" &
+            "12345 25G]PFNGLIKKJNJSKVLXNZP[T[VZXXYVZSZNYKXIVGTFPF RSWY]" &
+            "12345 17G\KFK[ RKFTFWGXHYJYLXNWOTPKP RRPY[" &
+            "12345 21H\YIWGTFPFMGKIKKLMMNOOUQWRXSYUYXWZT[P[MZKX" &
+            "12345  6JZRFR[ RKFYF" &
+            "12345 11G]KFKULXNZQ[S[VZXXYUYF" &
+            "12345  6I[JFR[ RZFR[" &
+            "12345 12F^HFM[ RRFM[ RRFW[ R\FW[" &
+            "12345  6H\KFY[ RYFK[" &
+            "12345  7I[JFRPR[ RZFRP" &
+            "12345  9H\YFK[ RKFYF RK[Y[" &
+            "12345 12KYOBOb RPBPb ROBVB RObVb" &
+            "12345  3KYKFY^" &
+            "12345 12KYTBTb RUBUb RNBUB RNbUb" &
+            "12345  6JZRDJR RRDZR" &
+            "12345  3I[Ib[b" &
+            "12345  8NVSKQMQORPSORNQO" &
+            "12345 18I\XMX[ RXPVNTMQMONMPLSLUMXOZQ[T[VZXX" &
+            "12345 18H[LFL[ RLPNNPMSMUNWPXSXUWXUZS[P[NZLX" &
+            "12345 15I[XPVNTMQMONMPLSLUMXOZQ[T[VZXX" &
+            "12345 18I\XFX[ RXPVNTMQMONMPLSLUMXOZQ[T[VZXX" &
+            "12345 18I[LSXSXQWOVNTMQMONMPLSLUMXOZQ[T[VZXX" &
+            "12345  9MYWFUFSGRJR[ ROMVM" &
+            "12345 23I\XMX]W`VaTbQbOa RXPVNTMQMONMPLSLUMXOZQ[T[VZXX" &
+            "12345 11I\MFM[ RMQPNRMUMWNXQX[" &
+            "12345  9NVQFRGSFREQF RRMR[" &
+            "12345 12MWRFSGTFSERF RSMS^RaPbNb" &
+            "12345  9IZMFM[ RWMMW RQSX[" &
+            "12345  3NVRFR[" &
+            "12345 19CaGMG[ RGQJNLMOMQNRQR[ RRQUNWMZM\N]Q][" &
+            "12345 11I\MMM[ RMQPNRMUMWNXQX[" &
+            "12345 18I\QMONMPLSLUMXOZQ[T[VZXXYUYSXPVNTMQM" &
+            "12345 18H[LMLb RLPNNPMSMUNWPXSXUWXUZS[P[NZLX" &
+            "12345 18I\XMXb RXPVNTMQMONMPLSLUMXOZQ[T[VZXX" &
+            "12345  9KXOMO[ ROSPPRNTMWM" &
+            "12345 18J[XPWNTMQMNNMPNRPSUTWUXWXXWZT[Q[NZMX" &
+            "12345  9MYRFRWSZU[W[ ROMVM" &
+            "12345 11I\MMMWNZP[S[UZXW RXMX[" &
+            "12345  6JZLMR[ RXMR[" &
+            "12345 12G]JMN[ RRMN[ RRMV[ RZMV[" &
+            "12345  6J[MMX[ RXMM[" &
+            "12345 10JZLMR[ RXMR[P_NaLbKb" &
+            "12345  9J[XMM[ RMMXM RM[X[" &
+            "12345 40KYTBRCQDPFPHQJRKSMSOQQ RRCQEQGRISJTLTNSPORSTTVTXSZR[Q]Q" &
+            "_Ra RQSSUSWRYQZP\P^Q`RaTb" &
+            "12345  3NVRBRb" &
+            "12345 40KYPBRCSDTFTHSJRKQMQOSQ RRCSESGRIQJPLPNQPURQTPVPXQZR[S]S" &
+            "_Ra RSSQUQWRYSZT\T^S`RaPb" &
+            "12345 24F^IUISJPLONOPPTSVTXTZS[Q RISJQLPNPPQTTVUXUZT[Q[O" &
+            "12345 35JZJFJ[K[KFLFL[M[MFNFN[O[OFPFP[Q[QFRFR[S[SFTFT[U[UFVFV[W" &
+            "[WFXFX[Y[YFZFZ[";
+
+   Font : Font_Desc := Desc'Access;
+
+   pragma Warnings (On);
+
+end Hershey_Fonts.FuturaL;
+=== ghal_examples/src/demo_2048/tasking.ads ===
+with System;
+with Gesture_Types; use Gesture_Types;
+
+package Tasking is
+
+   procedure Handle_Gesture (G : Gesture_Data);
+   procedure Toggle_Solver;
+
+   task Slider with
+     Priority     => System.Priority'Last,
+     Storage_Size => 8 * 1024;
+
+   task Controller with
+     Priority     => System.Priority'Last - 1,
+     Storage_Size => 32 * 1024;
+
+end Tasking;
+=== ghal_examples/src/demo_2048/status.ads ===
+with Bitmap; use Bitmap;
+
+package Status is
+   procedure Init_Area (Buffer : Bitmap_Buffer);
+   procedure Set_Score (Score : Natural);
+   function  Has_Buttons return Boolean;
+   procedure Set_Autoplay_Enabled (State : Boolean);
+   procedure Set_Autoplay (State : Boolean);
+   function  Get_Autoplay_Btn_Area return Rect;
+end Status;
+=== ghal_examples/src/demo_2048/bitmapped_drawing.adb ===
+with Board;
+with MT; use MT;
+
+package body Bitmapped_Drawing is
+
+   --  Draw a 1-pixel-wide line from (X0,Y0) to (X1,Y1) into Buffer.
+   --  Uses Bresenham. Each pixel is a 1x1 Fill_Rect via DMA2D.
+   procedure Draw_Line
+     (Buffer : Bitmap_Buffer;
+      X0, Y0, X1, Y1 : Integer;
+      Color : Bitmap_Color)
+   is
+      DX  : constant Integer := abs (X1 - X0);
+      DY  : constant Integer := abs (Y1 - Y0);
+      SX  : constant Integer := (if X0 < X1 then 1 else -1);
+      SY  : constant Integer := (if Y0 < Y1 then 1 else -1);
+      Err : Integer := DX - DY;
+      X   : Integer := X0;
+      Y   : Integer := Y0;
+      E2  : Integer;
+   begin
+      loop
+         if X >= 0 and then Y >= 0
+           and then X < Buffer.Width and then Y < Buffer.Height
+         then
+            Board.DMA2D.Fill_Rect (Buffer, Color, X, Y, 1, 1, False);
+         end if;
+         exit when X = X1 and then Y = Y1;
+         E2 := 2 * Err;
+         if E2 > -DY then
+            Err := Err - DY;
+            X   := X + SX;
+         end if;
+         if E2 < DX then
+            Err := Err + DX;
+            Y   := Y + SY;
+         end if;
+      end loop;
+   end Draw_Line;
+
+   --  Callback passed to Hershey_Fonts.Draw_Glyph
+   --  Buffer is captured via closure through a local access variable.
+   procedure Draw_String
+     (Buffer     : Bitmap_Buffer;
+      Start_X    : Natural;
+      Start_Y    : Natural;
+      Msg        : String;
+      Font       : Hershey_Font;
+      Height     : Natural;
+      Bold       : Boolean;
+      Foreground : Bitmap_Color;
+      Fast       : Boolean := True)
+   is
+      pragma Unreferenced (Fast);
+
+      Current_X : Natural := Start_X;
+      Current_Y : Natural := Start_Y;
+      Buf_Copy  : constant Bitmap_Buffer := Buffer;
+      FG        : constant Bitmap_Color  := Foreground;
+
+      procedure Stroke (X0, Y0, X1, Y1 : Natural; Width : Positive) is
+         pragma Unreferenced (Width);
+      begin
+         Draw_Line (Buf_Copy,
+                    Integer (X0), Integer (Y0),
+                    Integer (X1), Integer (Y1),
+                    FG);
+      end Stroke;
+
+      procedure Draw_Glyph is new Hershey_Fonts.Draw_Glyph (Stroke);
+
+   begin
+      for C of Msg loop
+         exit when Current_X >= Buffer.Width;
+         Draw_Glyph
+           (Fnt    => Font,
+            C      => C,
+            X      => Current_X,
+            Y      => Current_Y,
+            Height => Height,
+            Bold   => Bold);
+      end loop;
+   end Draw_String;
+
+end Bitmapped_Drawing;
+=== ghal_examples/src/demo_2048/game.ads ===
+with Bitmap;        use Bitmap;
+with DC_Types;      use DC_Types;
+with Gesture_Types; use Gesture_Types;
+with Grid;          use Grid;
+with Ada.Real_Time; use Ada.Real_Time;
+with Hershey_Fonts;
+with Hershey_Fonts.FuturaL;
+
+package Game is
+
+   Times : Hershey_Fonts.Hershey_Font;
+
+   procedure Init_Font;
+
+   The_Grid : CGrid;
+   --  Public so Tasking and Status can read Score and pass to Move.
+
+   procedure Init;
+   function  Get_Status_Area return Rect;
+   function  Get_Score return Natural;
+   procedure Start;
+   procedure Draw    (Dst : Bitmap_Buffer);
+   procedure Move    (Direction : Direction_E);
+   function  Can_Move (Direction : Direction_E) return Boolean;
+   function  Is_Sliding return Boolean;
+   function  Slide   (Dst : Bitmap_Buffer) return Boolean;
+   procedure Treat_Touch (G : Gesture_Data);
+
+private
+   type Pt  is record X, Y : Integer; end record;
+   type Spd is record X, Y : Integer; end record;
+
+   type Moving_Cell_T is record
+      Src, Dst   : Pt      := (0, 0);
+      Src_Value  : Integer := 0;
+      Dst_Value  : Integer := 0;
+      V          : Spd     := (0, 0);
+      Max_Length : Integer := 0;
+      Moving     : Boolean := False;
+   end record;
+
+   subtype Moving_Cells_Index_T is
+     Integer range 0 .. Size'Range_Length * Size'Range_Length - 1;
+   type Moving_Cells_A is array (Moving_Cells_Index_T) of Moving_Cell_T;
+
+   Moving_Cells     : Moving_Cells_A;
+   Sliding          : Boolean          := False;
+   Slide_Start_Time : Ada.Real_Time.Time;
+   Cell_Size        : Natural          := 0;
+   Ext_Border       : Natural          := 0;
+   Int_Border       : Natural          := 8;
+   Up_Margin        : Natural          := 0;
+
+   Background_Buffer       : Bitmap_Buffer;
+   Background_Slide_Buffer : Bitmap_Buffer;
+   Cells_Buffer            : Bitmap_Buffer;
+
+end Game;
+=== ghal_examples/src/demo_2048/grid.adb ===
+------------------------------------------------------------------------------
+--                        Bareboard drivers examples                        --
+--                                                                          --
+--                     Copyright (C) 2015-2016, AdaCore                     --
+--                                                                          --
+-- This library is free software;  you can redistribute it and/or modify it --
+-- under terms of the  GNU General Public License  as published by the Free --
+-- Software  Foundation;  either version 3,  or (at your  option) any later --
+-- version. This library is distributed in the hope that it will be useful, --
+-- but WITHOUT ANY WARRANTY;  without even the implied warranty of MERCHAN- --
+-- TABILITY or FITNESS FOR A PARTICULAR PURPOSE.                            --
+--                                                                          --
+-- As a special exception under Section 7 of GPL version 3, you are granted --
+-- additional permissions described in the GCC Runtime Library Exception,   --
+-- version 3.1, as published by the Free Software Foundation.               --
+--                                                                          --
+-- You should have received a copy of the GNU General Public License and    --
+-- a copy of the GCC Runtime Library Exception along with this program;     --
+-- see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see    --
+-- <http://www.gnu.org/licenses/>.                                          --
+--                                                                          --
+------------------------------------------------------------------------------
+
+package body Grid is
+
+   function Can_Move_Row (Row : in Row_T) return Boolean;
+   function Can_Move_Rows (Rows : in Rows_T) return Boolean;
+
+   ----------
+   -- Init --
+   ----------
+
+   procedure Init (G : in out CGrid) is
+   begin
+      G.Grid := (others => (others => 0));
+      G.Score := 0;
+   end Init;
+
+   ---------
+   -- Get --
+   ---------
+
+   function Get (G : in CGrid; X : Size; Y : Size) return Integer is
+   begin
+      return G.Grid (X, Y);
+   end Get;
+
+   ---------
+   -- Set --
+   ---------
+
+   procedure Set (G : in out CGrid; X : Size; Y : Size; Value : Integer) is
+   begin
+      G.Grid (X, Y) := Value;
+   end Set;
+
+
+   -----------------
+   -- Compact_Row --
+   -----------------
+
+   procedure Compact_Row (Row : in out Row_T;
+                          Score : in out Natural)
+   is
+      Cur_Idx : Size := 0;
+      Prev_Value : Integer := 0;
+   begin
+      for X in Size loop
+         if Row (X) /= 0 then
+            if Prev_Value = Row (X) then
+               --  merging cells
+               Row (Cur_Idx - 1) := Row (Cur_Idx - 1) + 1;
+               Score := Score + 2 ** Row (Cur_Idx - 1);
+               Prev_Value := 0;
+               Row (X) := 0;
+            else
+               --  filling blanks
+               Row (Cur_Idx) := Row (X);
+               Prev_Value := Row (Cur_Idx);
+
+               if Cur_Idx /= X then
+                  Row (X) := 0;
+               end if;
+               if Cur_Idx /= Size'Last then
+                  Cur_Idx := Cur_Idx + 1;
+               end if;
+            end if;
+         end if;
+      end loop;
+   end Compact_Row;
+
+   -----------------
+   -- Compact_Row --
+   -----------------
+
+   function Compact_Row (Row : in out Row_T;
+                         Score : in out Natural) return Row_Trace_T
+   is
+      Trace : Row_Trace_T := (others => 0);
+      Cur_Idx : Size := 0;
+      Prev_Value : Integer := 0;
+   begin
+      for X in Size loop
+         if Row (X) /= 0 then
+            if Prev_Value = Row (X) then
+               --  merging cells
+               Row (Cur_Idx - 1) := Row (Cur_Idx - 1) + 1;
+               Score := Score + 2 ** Row (Cur_Idx - 1);
+               Trace (X) :=  Cur_Idx - 1;
+               Prev_Value := 0;
+               Row (X) := 0;
+--               Trace (X) := 0;
+
+            else
+--               if Cur_Idx /= X then
+                  --  filling blanks
+               Row (Cur_Idx) := Row (X);
+               Trace (X) := Cur_Idx;
+
+               Prev_Value := Row (Cur_Idx);
+
+               if Cur_Idx /= X then
+                  Row (X) := 0;
+                  --  Trace (X) := X;
+
+               end if;
+               if Cur_Idx /= Size'Last then
+                  Cur_Idx := Cur_Idx + 1;
+               end if;
+            end if;
+         else
+            Trace (X) := X;
+         end if;
+      end loop;
+      return Trace;
+   end Compact_Row;
+
+   ------------------
+   -- Compact_Rows --
+   ------------------
+
+   procedure Compact_Rows (Rows  : in out Rows_T;
+                           Score : in out Natural) is
+   begin
+      for Y in Size loop
+         Compact_Row (Rows (Y), Score);
+      end loop;
+   end Compact_Rows;
+
+   function Compact_Rows (Rows  : in out Rows_T;
+                          Score : in out Natural) return Rows_Traces_T is
+      Traces : Rows_Traces_T;
+   begin
+      for Y in Size loop
+         Traces (Y) := Compact_Row (Rows (Y), Score);
+      end loop;
+      return Traces;
+   end Compact_Rows;
+
+   ------------------
+   -- Can_Move_Row --
+   ------------------
+
+   function Can_Move_Row (Row : in Row_T) return Boolean
+   is
+      Prev_Value : Integer := 0;
+      Hole : Boolean := False;
+   begin
+      for X in Size loop
+         if Row (X) = 0 then
+            Hole := True;
+         else
+            if Hole then
+               return True;
+            end if;
+            if Prev_Value = Row (X) then
+               return True;
+            end if;
+            Prev_Value := Row (X);
+         end if;
+      end loop;
+      return False;
+   end Can_Move_Row;
+
+   -------------------
+   -- Can_Move_Rows --
+   -------------------
+
+   function Can_Move_Rows (Rows : in Rows_T) return Boolean is
+   begin
+      for Y in Size loop
+         if Can_Move_Row (Rows (Y)) then
+            return True;
+         end if;
+      end loop;
+      return False;
+   end Can_Move_Rows;
+
+   ------------------
+   -- Grid_To_Rows --
+   ------------------
+
+   function Grid_To_Rows (G : in CGrid; Direction : Direction_E)  return Rows_T
+   is
+      Rows : Rows_T;
+   begin
+      case Direction is
+      when Left =>
+         for Y in Size loop
+            for X in Size loop
+               Rows (Y) (X) := G.Grid (X, Y);
+            end loop;
+         end loop;
+      when Right =>
+         for Y in Size loop
+            for X in Size loop
+               Rows (Y) (Size'Last - X) := G.Grid (X, Y);
+            end loop;
+         end loop;
+      when Up =>
+         for X in Size loop
+            for Y in Size loop
+               Rows (X) (Y) := G.Grid (X, Y);
+            end loop;
+         end loop;
+      when Down =>
+         for X in Size loop
+            for Y in Size loop
+               Rows (X) (Size'Last - Y) := G.Grid (X, Y);
+            end loop;
+         end loop;
+      end case;
+      return Rows;
+   end Grid_To_Rows;
+
+   ------------------
+   -- Rows_To_Grid --
+   ------------------
+
+   procedure Rows_To_Grid
+     (G         : in out CGrid;
+      Rows      : Rows_T;
+      Direction : Direction_E)
+   is
+   begin
+      case Direction is
+         when Left =>
+            for Y in Size loop
+               for X in Size loop
+                  G.Grid (X, Y) := Rows (Y) (X);
+               end loop;
+            end loop;
+         when Right =>
+            for Y in Size loop
+               for X in Size loop
+                  G.Grid (X, Y) := Rows (Y) (Size'Last - X);
+               end loop;
+            end loop;
+         when Up =>
+            for X in Size loop
+               for Y in Size loop
+                  G.Grid (X, Y) := Rows (X) (Y);
+               end loop;
+            end loop;
+         when Down =>
+            for X in Size loop
+               for Y in Size loop
+                  G.Grid (X, Y) := Rows (X) (Size'Last - Y);
+               end loop;
+            end loop;
+      end case;
+   end Rows_To_Grid;
+
+   -------------------------
+   -- Traces_To_Move_Grid --
+   -------------------------
+
+   function Traces_To_Move_Grid
+     (Traces    : Rows_Traces_T;
+      Direction : Direction_E) return Trace_Grid_T
+   is
+      Move_Grid : Trace_Grid_T;
+   begin
+      case Direction is
+         when Left =>
+            for Y in Size loop
+               for X in Size loop
+                  Move_Grid (X, Y) := (Traces (Y) (X), Y);
+               end loop;
+            end loop;
+         when Right =>
+            for Y in Size loop
+               for X in Size loop
+                  Move_Grid (Size'Last - X, Y) :=
+                    (Size'Last - Traces (Y) (X), Y);
+               end loop;
+            end loop;
+         when Up =>
+            for X in Size loop
+               for Y in Size loop
+                  Move_Grid (X, Y) := (X, Traces (X) (Y));
+               end loop;
+            end loop;
+         when Down =>
+            for X in Size loop
+               for Y in Size loop
+                  Move_Grid (X, Size'Last - Y) :=
+                    (X, Size'Last - Traces (X) (Y));
+               end loop;
+            end loop;
+      end case;
+      return Move_Grid;
+   end Traces_To_Move_Grid;
+
+   --------------
+   -- Can_Move --
+   --------------
+
+   function Can_Move
+     (G         : in out CGrid;
+      Direction : Direction_E) return Boolean
+   is
+      Rows : constant Rows_T := G.Grid_To_Rows (Direction);
+   begin
+      return Can_Move_Rows (Rows);
+   end Can_Move;
+
+   procedure Move (G : in out CGrid; Direction : Direction_E) is
+      Rows : Rows_T := G.Grid_To_Rows (Direction);
+   begin
+      Compact_Rows (Rows, G.Score);
+      G.Rows_To_Grid (Rows, Direction);
+   end Move;
+
+   ----------
+   -- Move --
+   ----------
+
+   function Move
+     (G         : in out CGrid;
+      Direction : Direction_E) return Trace_Grid_T
+   is
+      Rows : Rows_T := G.Grid_To_Rows (Direction);
+      Traces : Rows_Traces_T;
+   begin
+      Traces := Compact_Rows (Rows, G.Score);
+      G.Rows_To_Grid (Rows, Direction);
+      return Traces_To_Move_Grid (Traces, Direction);
+   end Move;
+
+end Grid;
+=== ghal_examples/src/demo_2048/hershey_fonts.ads ===
+------------------------------------------------------------------------------
+--                        Bareboard drivers examples                        --
+--                                                                          --
+--                     Copyright (C) 2015-2016, AdaCore                     --
+--                                                                          --
+-- This library is free software;  you can redistribute it and/or modify it --
+-- under terms of the  GNU General Public License  as published by the Free --
+-- Software  Foundation;  either version 3,  or (at your  option) any later --
+-- version. This library is distributed in the hope that it will be useful, --
+-- but WITHOUT ANY WARRANTY;  without even the implied warranty of MERCHAN- --
+-- TABILITY or FITNESS FOR A PARTICULAR PURPOSE.                            --
+--                                                                          --
+-- As a special exception under Section 7 of GPL version 3, you are granted --
+-- additional permissions described in the GCC Runtime Library Exception,   --
+-- version 3.1, as published by the Free Software Foundation.               --
+--                                                                          --
+-- You should have received a copy of the GNU General Public License and    --
+-- a copy of the GCC Runtime Library Exception along with this program;     --
+-- see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see    --
+-- <http://www.gnu.org/licenses/>.                                          --
+--                                                                          --
+------------------------------------------------------------------------------
+
+--  This package handles the Hershey font format.
+
+with Interfaces; use Interfaces;
+
+package Hershey_Fonts is
+
+   type Font_Desc is access constant String;
+
+   type Hershey_Font is private;
+
+   type Glyph_Index is private;
+
+   function Valid_Glyph (Val : Natural) return Boolean;
+
+   function Read (Fnt : Font_Desc) return Hershey_Font;
+   procedure Read (Fnt : Font_Desc;
+                   Ret : out Hershey_Font);
+
+   function Strlen (S      : String;
+                    Fnt    : Hershey_Font;
+                    Height : Natural) return Natural;
+
+   generic
+      with procedure Draw_Line
+        (X0, Y0, X1, Y1 : Natural;
+         Width          : Positive);
+   procedure Draw_Glyph
+     (Fnt     : Hershey_Font;
+      C       : Character;
+      X       : in out Natural;
+      Y       : Natural;
+      Height  : Natural;
+      Bold    : Boolean);
+
+private
+
+   type Coord is record
+      X : Interfaces.Integer_8;
+      Y : Interfaces.Integer_8;
+   end record with Size => 16;
+
+   Raise_Pen : constant Coord := (others => Integer_8'First);
+
+   type Coord_Array is array (Positive range <>) of Coord
+     with Component_Size => 16;
+
+   type Glyph is record
+      Vertices : Natural;
+      Width    : Unsigned_8;
+      Height   : Unsigned_8;
+      Coords   : Coord_Array (1 .. 120);
+   end record with Pack;
+
+   type Glyph_Index is new Positive range 1 .. 96;
+
+   function Valid_Glyph (Val : Natural) return Boolean
+   is (Val in 1 .. 96);
+
+   type Glyph_Array is array (Glyph_Index) of Glyph;
+
+   type Hershey_Font is record
+      Number_Of_Glyphs : Glyph_Index;
+      Glyphs           : Glyph_Array;
+      Font_Height      : Unsigned_8;
+      Baseline         : Unsigned_8;
+   end record;
+
+end Hershey_Fonts;
+=== ghal_examples/src/demo_2048/status.adb ===
+with Bitmap;            use Bitmap;
+with Bitmapped_Drawing;
+with Board;
+with DC_Types;          use DC_Types;
+with Game;
+with Hershey_Fonts;
+
+package body Status is
+
+   Null_Rect : constant Rect := (0, 0, 0, 0);
+   G_Area    : Rect := Null_Rect;
+   Score_Area : Rect := Null_Rect;
+   High_Area  : Rect := Null_Rect;
+   Btn_Area   : Rect := Null_Rect;
+   Margin     : Natural := 4;
+
+   Box_BG    : constant Bitmap_Color := (255, 187, 173, 160);
+   Box_FG    : constant Bitmap_Color := (255, 255, 255, 255);
+   Label_FG  : constant Bitmap_Color := (255, 230, 213, 197);
+
+   G_High : Integer := -1;
+
+   type AP_State is (Disabled, Off, On);
+   G_AP : AP_State := Disabled;
+
+   procedure Draw_Label
+      (Buf : Bitmap_Buffer; Area : Rect; Msg : String; FG : Bitmap_Color)
+   is
+      Max_H : constant Natural := Natural'Max (1, Area.Height * 2 / 5);
+      Raw_W : constant Natural := Hershey_Fonts.Strlen (Msg, Game.Times, Max_H);
+      H     : constant Natural :=
+        (if Raw_W <= Area.Width - 2 * Margin then
+            Max_H
+         else
+            Natural'Max (1, Max_H * (Area.Width - 2 * Margin) / Raw_W));
+   begin
+      Bitmapped_Drawing.Draw_String
+        (Buffer     => Buf,
+         Start_X    => Area.X + Margin,
+         Start_Y    => Area.Y + Margin,
+         Msg        => Msg,
+         Font       => Game.Times,
+         Height     => H,
+         Bold       => False,
+         Foreground => FG);
+   end Draw_Label;
+
+   procedure Init_Area (Buffer : Bitmap_Buffer) is
+      W : constant Natural := Buffer.Width;
+      H : constant Natural := Buffer.Height;
+   begin
+      if G_Area /= Null_Rect then return; end if;
+      G_Area := Game.Get_Status_Area;
+
+      --  Layer 2 uses alpha (ARGB4444). Clear the whole layer first so
+      --  uninitialized SDRAM alpha/pixels do not blend as random noise.
+      Board.DMA2D.Fill (Buffer, Transparent, True);
+
+      Score_Area := (Margin, Margin,
+                     W / 2 - 2 * Margin, H / 3 - Margin);
+      High_Area  := (W / 2 + Margin, Margin,
+                     W / 2 - 2 * Margin, H / 3 - Margin);
+      Btn_Area   := (Margin * 4, H / 3 + Margin,
+                     W - 8 * Margin, H / 3);
+
+      Board.DMA2D.Fill_Rect (Buffer, Box_BG,
+        Score_Area.X, Score_Area.Y, Score_Area.Width, Score_Area.Height, True);
+      Draw_Label (Buffer, Score_Area, "SCORE", Label_FG);
+
+      Board.DMA2D.Fill_Rect (Buffer, Box_BG,
+        High_Area.X, High_Area.Y, High_Area.Width, High_Area.Height, True);
+      Draw_Label (Buffer, High_Area, "BEST", Label_FG);
+   end Init_Area;
+
+   function Has_Buttons return Boolean is (Btn_Area /= Null_Rect);
+
+   function Get_Autoplay_Btn_Area return Rect is
+     (X      => Btn_Area.X + G_Area.X,
+      Y      => Btn_Area.Y + G_Area.Y,
+      Width  => Btn_Area.Width,
+      Height => Btn_Area.Height);
+
+   procedure Draw_Button (Buf : Bitmap_Buffer) is
+      BG : constant Bitmap_Color :=
+             (case G_AP is
+                when Disabled => (255, 180, 180, 180),
+                when Off      => (255, 200, 200, 200),
+                when On       => (255, 100, 200, 100));
+      FG : constant Bitmap_Color :=
+             (case G_AP is
+                when Disabled => (255, 150, 150, 150),
+                when Off | On => (255, 50, 50, 50));
+   begin
+      Board.DMA2D.Fill_Rect (Buf, BG,
+        Btn_Area.X, Btn_Area.Y, Btn_Area.Width, Btn_Area.Height, True);
+      Draw_Label (Buf, Btn_Area, "AUTO", FG);
+   end Draw_Button;
+
+   procedure Set_Autoplay_Enabled (State : Boolean) is
+      Buf : constant Bitmap_Buffer := Board.FB_1.Get_Hidden_Buffer (Layer_2);
+   begin
+      G_AP := (if State then Off else Disabled);
+      Draw_Button (Buf);
+   end Set_Autoplay_Enabled;
+
+   procedure Set_Autoplay (State : Boolean) is
+      Buf : constant Bitmap_Buffer := Board.FB_1.Get_Hidden_Buffer (Layer_2);
+   begin
+      if G_AP = Disabled then return; end if;
+      G_AP := (if State then On else Off);
+      Draw_Button (Buf);
+   end Set_Autoplay;
+
+   procedure Set_Score (Score : Natural) is
+      Img : constant String := Score'Image;
+      Buf : constant Bitmap_Buffer := Board.FB_1.Get_Hidden_Buffer (Layer_2);
+      Msg : constant String := Img (Img'First + 1 .. Img'Last);
+      Max_H : constant Natural := Natural'Max (1, Score_Area.Height * 2 / 5);
+      Raw_W : constant Natural := Hershey_Fonts.Strlen (Msg, Game.Times, Max_H);
+      H   : constant Natural :=
+        (if Raw_W <= Score_Area.Width - 2 * Margin then
+            Max_H
+         else
+            Natural'Max (1, Max_H * (Score_Area.Width - 2 * Margin) / Raw_W));
+      Y   : constant Natural := Score_Area.Y + Score_Area.Height / 2;
+   begin
+      Board.DMA2D.Fill_Rect (Buf, Box_BG,
+        Score_Area.X, Y, Score_Area.Width, Score_Area.Height / 2, True);
+      Bitmapped_Drawing.Draw_String
+         (Buffer     => Buf,
+          Start_X    => Score_Area.X + Margin,
+          Start_Y    => Y,
+          Msg        => Msg,
+          Font       => Game.Times,
+          Height     => H,
+         Bold       => True,
+         Foreground => Box_FG);
+
+      if Score > G_High then
+         G_High := Score;
+         Board.DMA2D.Fill_Rect (Buf, Box_BG,
+           High_Area.X, Y, High_Area.Width, High_Area.Height / 2, True);
+         Bitmapped_Drawing.Draw_String
+           (Buffer     => Buf,
+            Start_X    => High_Area.X + Margin,
+            Start_Y    => Y,
+            Msg        => Msg,
+            Font       => Game.Times,
+            Height     => H,
+            Bold       => True,
+            Foreground => Box_FG);
+      end if;
+   end Set_Score;
+
+end Status;

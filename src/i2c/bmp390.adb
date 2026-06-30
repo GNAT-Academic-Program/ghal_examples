@@ -80,7 +80,7 @@ package body BMP390 is
       Raw_T2 : MT.UInt16;
       Raw_T3 : Int8;
    begin
-      Bus.Write_Read (Dev.Bus.all, Dev.Addr, Tx, Rx);
+      Bus.Write_Read (Dev.Addr, Tx, Rx);
 
       Raw_T1 := LE_UInt16 (Rx (1), Rx (2));
       Raw_T2 := LE_UInt16 (Rx (3), Rx (4));
@@ -100,7 +100,7 @@ package body BMP390 is
       Tx : constant Storage_Array (1 .. 1) := [1 => Status_Reg_Loc];
       Rx : Storage_Array (1 .. 1);
    begin
-      Bus.Write_Read (Dev.Bus.all, Dev.Addr, Tx, Rx);
+      Bus.Write_Read (Dev.Addr, Tx, Rx);
       return Byte_To_Status_Reg (Rx (1));
    end Get_Status_Reg;
    pragma Unreferenced (Get_Status_Reg);
@@ -120,7 +120,7 @@ package body BMP390 is
         [1 => Pwr_Ctrl_Reg,
          2 => To_Byte (Pwr_Ctrl)];
    begin
-      Bus.Write (Dev.Bus.all, Dev.Addr, Tx);
+      Bus.Write (Dev.Addr, Tx);
       delay until Clock + Power_Settle_Time;
    end Set_Pwr_Ctrl;
 
@@ -130,12 +130,10 @@ package body BMP390 is
 
    procedure Open
      (Dev      : in out Sensor;
-      I2C      : access Bus.Device;
       Addr     : I2C_Types.I2C_Address;
       Pwr_Ctrl : Pwr_Control)
    is
    begin
-      Dev.Bus  := I2C;
       Dev.Addr := Addr;
       Set_Pwr_Ctrl   (Dev, Pwr_Ctrl);
       Set_Correction (Dev);
@@ -149,7 +147,7 @@ package body BMP390 is
       Tx : constant Storage_Array (1 .. 1) := [1 => Chip_Id_Reg];
       Rx : Storage_Array (1 .. 1) := [1 => 0];
    begin
-      Bus.Write_Read (Dev.Bus.all, Dev.Addr, Tx, Rx);
+      Bus.Write_Read (Dev.Addr, Tx, Rx);
       return Chip_Id (Rx (1));
    end Read_Chip_Id;
 
@@ -164,7 +162,7 @@ package body BMP390 is
       Tx : constant Storage_Array (1 .. 1) := [1 => Pwr_Ctrl_Reg];
       Rx : Storage_Array (1 .. 1);
    begin
-      Bus.Write_Read (Dev.Bus.all, Dev.Addr, Tx, Rx);
+      Bus.Write_Read (Dev.Addr, Tx, Rx);
       Pwr_Ctrl := Rx (1);
    end Read_Pwr_Control;
 
@@ -179,7 +177,7 @@ package body BMP390 is
       Tx : constant Storage_Array (1 .. 1) := [1 => Temp_Data_Reg];
       Rx : Storage_Array (1 .. 3);
    begin
-      Bus.Write_Read (Dev.Bus.all, Dev.Addr, Tx, Rx);
+      Bus.Write_Read (Dev.Addr, Tx, Rx);
       Raw := Raw_Temperature (Rx (1))
            + Raw_Temperature (Rx (2)) * 256
            + Raw_Temperature (Rx (3)) * 65_536;

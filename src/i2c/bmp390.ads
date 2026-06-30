@@ -7,6 +7,10 @@ with I2C_Interface;
 with MT;
 with System.Storage_Elements; use System.Storage_Elements;
 
+--  BMP390 is a device-level driver for the Bosch BMP390 pressure/temperature sensor.
+--  It is generic over an I2C bus package (which models the physical I2C peripheral).
+--  Each Sensor record carries the chip's I2C address and calibration state.
+
 generic
    with package Bus is new I2C_Interface (<>);
 package BMP390 is
@@ -45,7 +49,6 @@ package BMP390 is
 
    procedure Open
      (Dev      : in out Sensor;
-      I2C      : access Bus.Device;
       Addr     : I2C_Types.I2C_Address;
       Pwr_Ctrl : Pwr_Control);
 
@@ -72,7 +75,6 @@ private
    end record;
 
    type Sensor is record
-      Bus  : access Bus.Device;
       Addr : I2C_Types.I2C_Address;
       Cal  : Calibration;
    end record;

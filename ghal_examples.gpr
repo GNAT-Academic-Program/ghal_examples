@@ -8,17 +8,20 @@ project Ghal_Examples is
    for Create_Missing_Dirs use "True";
    for Exec_Dir use "bin";
    for Main use (
-      --"nor_flash_0.adb", 
-      "i2c_bmp.adb",
-      --"i2c_0", 
+      --"nor_flash_0.adb",
+      --"i2c_bmp.adb",
+      --"i2c_0",
       --"spi_0.adb",
-      "blinky_0.adb");
+      --"blinky_0.adb"
+      "test_sdram.adb"
+      --"demo_2048.adb"
+      );
 
    for Target use runtime_build'Target;
    for Runtime ("Ada") use runtime_build'Runtime ("Ada");
 
    package Compiler is
-      for Default_Switches ("Ada") use Ghal_Examples_Config.Ada_Compiler_Switches;
+      for Default_Switches ("Ada") use Ghal_Examples_Config.Ada_Compiler_Switches & ("-gnat2022");
    end Compiler;
 
    package Linker is
