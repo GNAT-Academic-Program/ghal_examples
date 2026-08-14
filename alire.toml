@@ -8,18 +8,17 @@ maintainers = ["Olivier Henley <olivier.henley@adacore.com>"]
 "*".runtime_checks = "none"
 
 [[depends-on]]
-#machine_types            = "*"
-#bitmap                   = "*"
-#dc_generic               = "*"
-#fb_generic               = "*"
-#gesture                  = "*"
-#touch_generic            = "*"
-stm32f469i_disco         = "*"
+bitmap                   = "*"
+dc_generic               = "*"
+fb_generic               = "*"
+gesture                  = "*"
+touch_generic            = "*"
+stm32f746g_disco         = "*"
 
 [[pins]]
-stm32f469i_disco = { path = "../stm32f469i_disco" }
-#gesture          = { path = "../gesture" }
-#bitmap           = { path = "../bitmap" }
-#dc_generic       = { path = "../dc_generic" }
-#fb_generic       = { path = "../fb_generic" }
-#touch_generic    = { path = "../touch_generic" }
+stm32f746g_disco = { url = "https://github.com/GNAT-Academic-Program/stm32f746g_disco.git", branch = "main" }
+gesture          = { url = "https://github.com/GNAT-Academic-Program/gesture.git", branch = "main" }
+bitmap           = { url = "https://github.com/GNAT-Academic-Program/bitmap.git", branch = "main" }
+dc_generic       = { url = "https://github.com/GNAT-Academic-Program/dc_generic.git", branch = "main" }
+fb_generic       = { url = "https://github.com/GNAT-Academic-Program/fb_generic.git", branch = "main" }
+touch_generic    = { url = "https://github.com/GNAT-Academic-Program/touch_generic.git", branch = "main" }

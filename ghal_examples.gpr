@@ -13,8 +13,8 @@ project Ghal_Examples is
       --"i2c_0",
       --"spi_0.adb",
       --"blinky_0.adb"
-      "test_sdram.adb"
-      --"demo_2048.adb"
+      --"test_sdram.adb"
+      "demo_2048.adb"
       );
 
    for Target use runtime_build'Target;
