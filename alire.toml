@@ -2,7 +2,7 @@ name = "ghal_examples"
 description = "GHAL demo applications - 2048 for STM32F746G-DISCO"
 version = "0.1.0"
 licenses = "Apache-2.0"
-maintainers = ["Olivier Henley <olivier.henley@adacore.com>"]
+maintainers = ["Olivier Henley <olivier.henley@gmail.com>"]
 
 [build-switches]
 "*".runtime_checks = "none"
